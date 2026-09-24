@@ -1,0 +1,69 @@
+name: V2 API Release Readiness Review
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "prisma/**"
+      - "test/**"
+      - "scripts/**"
+      - "docs/**"
+      - ".github/workflows/**"
+      - "package.json"
+      - "package-lock.json"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v2-release-readiness-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  readiness-preflight:
+    name: Readiness Preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: node scripts/release-readiness/validate-review-inputs.mjs
+
+  readiness-evidence:
+    name: Readiness Evidence Validation
+    runs-on: ubuntu-latest
+    needs: readiness-preflight
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: node scripts/release-readiness/validate-evidence.mjs
+
+  required-readiness-gate:
+    name: Required Release Readiness Gate
+    if: always()
+    needs:
+      - readiness-preflight
+      - readiness-evidence
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail closed on incomplete readiness review
+        if: >-
+          ${{
+            needs.readiness-preflight.result != 'success' ||
+            needs.readiness-evidence.result != 'success'
+          }}
+        run: |
+          echo "Release readiness review is incomplete or failed."
+          exit 1
+      - run: echo "Release readiness review inputs passed validation."
