@@ -1,0 +1,159 @@
+name: Backend CI Security and Quality Gates (Parallel)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run lint -- --no-fix
+
+  unit-tests:
+    name: Unit and Coverage Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run test:cov
+
+  build-artifact:
+    name: Build and Generated Artifact Drift
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: git diff --exit-code -- . ':!package-lock.json'
+
+  security:
+    name: Dependency and Secret Security
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      - uses: trufflesecurity/trufflehog@main
+        with:
+          extra_args: --results=verified,unknown
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: javascript-typescript
+      - uses: github/codeql-action/analyze@v4
+
+  container:
+    name: Container Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build --tag truthbounty-api:ci .
+      - uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: truthbounty-api:ci
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+
+  migration:
+    name: Migration Validation
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: truthbounty_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d truthbounty_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/truthbounty_ci
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run migration:run
+
+  sensitive-changes:
+    name: Sensitive Change Review Signal
+    runs-on: ubuntu-latest
+    steps:
+      - if: github.event_name != 'pull_request'
+        run: echo "Sensitive review signal applies to pull requests."
+      - uses: dorny/paths-filter@v4
+        id: filter
+        if: github.event_name == 'pull_request'
+        with:
+          filters: |
+            sensitive:
+              - 'src/auth/**'
+              - 'src/indexer/**'
+              - 'src/database/**'
+              - 'prisma/**'
+              - '.github/workflows/**'
+      - if: github.event_name == 'pull_request' && steps.filter.outputs.sensitive == 'true'
+        run: |
+          echo "::warning::Sensitive paths changed; explicit human maintainer review is required."
+          echo "Enforce approval through CODEOWNERS and branch protection."
+      - if: github.event_name == 'pull_request' && steps.filter.outputs.sensitive != 'true'
+        run: echo "No configured sensitive paths changed."
+
+  required:
+    name: Required Gates
+    if: always()
+    needs: [lint, unit-tests, build-artifact, security, container, migration, sensitive-changes]
+    runs-on: ubuntu-latest
+    steps:
+      - if: >-
+          ${{
+            needs.lint.result != 'success' ||
+            needs.unit-tests.result != 'success' ||
+            needs.build-artifact.result != 'success' ||
+            needs.security.result != 'success' ||
+            needs.container.result != 'success' ||
+            needs.migration.result != 'success' ||
+            needs.sensitive-changes.result != 'success'
+          }}
+        run: |
+          echo "One or more required CI gates failed or were skipped."
+          exit 1
+      - run: echo "All required CI gates passed."
