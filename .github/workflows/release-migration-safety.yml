@@ -1,0 +1,80 @@
+name: Release Migration Safety
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "prisma/**"
+      - "src/prisma/**"
+      - "src/database/**"
+      - "src/config/**"
+      - "scripts/release-safety/**"
+      - "test/release-safety/**"
+      - "docs/release-safety/**"
+      - ".github/workflows/release-migration-safety.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-migration-safety-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  migration-safety-preflight:
+    name: Migration Safety Preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Verify Prisma migration metadata
+        run: |
+          test -f prisma/schema.prisma
+          test -f prisma/migrations/migration_lock.toml
+          grep -q 'provider = "sqlite"' prisma/migrations/migration_lock.toml
+
+      - name: Run static safety checks
+        run: node scripts/release-safety/validate-migration-safety.mjs
+
+  compatibility-contract:
+    name: Compatibility Contract Checks
+    runs-on: ubuntu-latest
+    needs: migration-safety-preflight
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+      - run: node scripts/release-safety/compatibility-contract.mjs
+
+  release-safety-gate:
+    name: Release Migration Safety Gate
+    if: always()
+    needs:
+      - migration-safety-preflight
+      - compatibility-contract
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail closed when a safety job fails or is skipped
+        if: >-
+          ${{
+            needs.migration-safety-preflight.result != 'success' ||
+            needs.compatibility-contract.result != 'success'
+          }}
+        run: |
+          echo "Release migration safety gate failed or was skipped."
+          exit 1
+
+      - run: echo "Release migration safety checks passed."
